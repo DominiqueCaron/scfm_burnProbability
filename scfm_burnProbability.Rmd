@@ -45,7 +45,7 @@ download.file(url = "https://img.shields.io/badge/Made%20with-Markdown-1f425f.pn
 
 ### Why this module exists
 
-`scfm` (the Spatially Contagious Fire Model) splits one simulated fire year across
+`scfm` splits one simulated fire year across
 three modules -- `scfmIgnition` draws which pixels ignite, `scfmEscape` draws which
 ignitions escape and grow one step with `SpaDES.tools::spread2()`, and `scfmSpread`
 grows escaped fires the rest of the way and records the burned pixels. Run once,

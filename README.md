@@ -1,7 +1,7 @@
 # scfm_burnProbability
 
 Estimates each flammable pixel's probability of burning, by Monte Carlo, from the
-scfm (Spatially Contagious Fire Model) ignition, escape, and spread modules
+scfm ignition, escape, and spread modules
 (`scfmIgnition`, `scfmEscape`, `scfmSpread`). Parallels `fireSense_burnProbability`;
 see `scfm_burnProbability.Rmd` for module documentation.
 

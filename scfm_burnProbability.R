@@ -150,9 +150,9 @@ estimateBurnProbability <- function(sim) {
   burnCount[flamVals == 0] <- NA
 
   for (i in seq_len(nIter)) {
-    sim <- sim$.mods$scfmIgnition$Ignite(sim)
-    sim <- sim$.mods$scfmEscape$Escape(sim)
-    sim <- sim$.mods$scfmSpread$Burnemup(sim)
+    sim <- runAsModule(sim, "scfmIgnition", sim$.mods$scfmIgnition$Ignite)
+    sim <- runAsModule(sim, "scfmEscape", sim$.mods$scfmEscape$Escape)
+    sim <- runAsModule(sim, "scfmSpread", sim$.mods$scfmSpread$Burnemup)
 
     burned <- !is.na(terra::values(sim$rstCurrentBurn, mat = FALSE)) &
       terra::values(sim$rstCurrentBurn, mat = FALSE) == 1
@@ -164,6 +164,31 @@ estimateBurnProbability <- function(sim) {
   sim$burnProbability <- burnCount / nIter
 
   invisible(sim)
+}
+
+#' Run a delegate module's function with `current(sim)` set to that module
+#'
+#' `P(sim)` (no explicit module name) resolves against `sim@current$moduleName`,
+#' i.e. whichever module the scheduler currently has active -- not whichever
+#' module's function is lexically executing. Calling e.g.
+#' `sim$.mods$scfmSpread$Burnemup(sim)` directly from inside
+#' `scfm_burnProbability`'s own event leaves `sim@current$moduleName` set to
+#' `"scfm_burnProbability"`, so any `P(sim)$<param>` lookups inside `Burnemup()`
+#' silently return `NULL` instead of `scfmSpread`'s parameters. This wraps such
+#' a call so `sim@current$moduleName` is temporarily set to `moduleName`,
+#' restoring the prior value on the `simList` that `fn` returns.
+#'
+#' @param sim A `simList`.
+#' @param moduleName character; the name of the module whose function is being run.
+#' @param fn The module's event function (e.g. `sim$.mods$scfmSpread$Burnemup`).
+#'
+#' @return The `simList`, as returned by `fn`.
+runAsModule <- function(sim, moduleName, fn) {
+  prevCurrent <- sim@current
+  sim@current <- modifyList(prevCurrent, list(moduleName = moduleName))
+  sim <- fn(sim)
+  sim@current <- prevCurrent
+  sim
 }
 
 #' Snapshot a set of `sim$` objects before they are overwritten

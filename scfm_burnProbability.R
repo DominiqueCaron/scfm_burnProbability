@@ -4,9 +4,7 @@ defineModule(sim, list(
   name = "scfm_burnProbability",
   description = paste(
     "Estimates each pixel's probability of burning in a given year by Monte Carlo:",
-    "repeatedly re-draws ignitions, escapes, and fire spread (via",
-    "scfmIgnition, scfmEscape and scfmSpread) without touching the",
-    "simulation's realized fire outputs, and tallies how often each pixel burns."),
+    "repeatedly re-draws ignitions, escapes, and fire spread."),
   keywords = c("fire", "probability", "monte carlo", "scfm"),
   authors = c(
     person("Dominique", "Caron", email = "", role = c("aut", "cre"))
@@ -17,10 +15,10 @@ defineModule(sim, list(
   timeunit = "year",
   citation = list("citation.bib"),
   documentation = list("README.md", "scfm_burnProbability.Rmd"),
-  reqdPkgs = list("data.table", "terra", "SpaDES.core (>=3.0.4)"),
+  reqdPkgs = list("data.table", "terra", "SpaDES.core (>=3.0.4)", "reproducible"),
   loadOrder = list(after = c("scfmIgnition", "scfmEscape", "scfmSpread")),
   parameters = bindrows(
-    defineParameter("nIterations", "integer", 10000L, 1L, NA,
+    defineParameter("nIterations", "integer", 10^6, 1L, NA,
                     desc = paste("Number of Monte Carlo iterations (independent ignition/escape/spread",
                                  "draws) used to estimate burn probability at each `.runInterval`.")),
     defineParameter(".runInitialTime", "numeric", default = start(sim), NA, NA,
@@ -31,43 +29,30 @@ defineModule(sim, list(
                                  "probability surfaces (`pIg`, `p0`, `pSpread`), held fixed across all",
                                  "`nIterations` draws.")),
     defineParameter(".studyAreaName", "character", NA, NA, NA,
-                    "Human-readable name for the study area used.")
+                    "Human-readable name for the study area used."),
+    defineParameter(".useCache", "logical", TRUE, NA, NA,
+                    desc = paste("Cache the Monte Carlo estimate (`runMonteCarlo()`), keyed on `pIg`,",
+                                 "`p0`, `pSpread`, `flammableMap`, `fireRegimePolys`, `fireRegimeRas`,",
+                                 "`nIterations` and the `neighbours` parameters. Repeated calls with",
+                                 "unchanged inputs (e.g. the same year re-run, or an unchanged scenario)",
+                                 "return the cached `burnProbability` instead of re-running `nIterations`",
+                                 "Monte Carlo draws."))
   ),
   inputObjects = bindrows(
     expectsInput("flammableMap", "SpatRaster", sourceURL = NA,
-                 "Binary/categorical flammability raster, as used by `scfmEscape` and `scfmSpread`. Template for `burnProbability`."),
-    expectsInput("rasterToMatch", "SpatRaster", sourceURL = NA,
-                 "Template raster for the study area (as used by the scfm modules)."),
+                 paste("Binary/categorical flammability raster, as used by `scfmEscape` and",
+                       "`scfmSpread`. Template for `burnProbability`; also passed straight to",
+                       "`spread2()` inside `fastEscape()`/`fastBurn()`.")),
     expectsInput("fireRegimePolys", "SpatVector",
-                 paste("Fire regime polygons with `pIgnition`, `p0`, `pSpread`, `maxBurnCells`,",
-                       "`cellSize` and `PolyID`, from `scfmDataPrep`. Held fixed across Monte Carlo draws.")),
+                 "Fire regime polygons with `maxBurnCells` and `PolyID`, from `scfmDataPrep`."),
     expectsInput("fireRegimeRas", "SpatRaster",
-                 "Raster of fire regime polygon IDs, from `scfmDataPrep`. Held fixed across Monte Carlo draws."),
+                 "Raster of fire regime polygon IDs, from `scfmDataPrep`."),
     expectsInput("pIg", "SpatRaster|numeric",
-                 "This year's per-pixel ignition probability surface, from `scfmIgnition`. Held fixed across Monte Carlo draws."),
+                 "This year's per-pixel ignition probability surface, from `scfmIgnition`."),
     expectsInput("p0", "SpatRaster|numeric",
-                 "This year's per-pixel escape probability surface, from `scfmEscape`. Held fixed across Monte Carlo draws."),
+                 "This year's per-pixel escape probability surface, from `scfmEscape`."),
     expectsInput("pSpread", "SpatRaster|numeric",
-                 "This year's per-pixel spread probability surface, from `scfmSpread`. Held fixed across Monte Carlo draws."),
-    expectsInput("ignitionLoci", "numeric",
-                 paste("This year's *realized* ignition pixels, from `scfmIgnition`.",
-                       "Snapshotted and restored; never left modified by the Monte Carlo loop.")),
-    expectsInput("spreadState", "data.table",
-                 paste("This year's *realized* escaped-fire start pixels, from `scfmEscape`.",
-                       "Snapshotted and restored; never left modified by the Monte Carlo loop.")),
-    expectsInput("burnDT", "data.table",
-                 "This year's *realized* burned-pixel table, from `scfmSpread`. Snapshotted and restored."),
-    expectsInput("burnMap", "SpatRaster",
-                 paste("Cumulative burn map, from `scfmSpread`.",
-                       "Snapshotted and restored, never left modified by the Monte Carlo loop.")),
-    expectsInput("rstCurrentBurn", "SpatRaster",
-                 "This year's *realized* current-year burn indicator, from `scfmSpread`. Snapshotted and restored."),
-    expectsInput("burnSummary", "data.table",
-                 paste("Cumulative per-fire summary, from `scfmSpread`. Snapshotted and restored",
-                       "(each Monte Carlo draw would otherwise append a spurious row).")),
-    expectsInput("timeSinceFire", "SpatRaster",
-                 paste("Time-since-fire raster, from `scfmSpread`; updated every year including years",
-                       "with no fire. Snapshotted and restored."))
+                 "This year's per-pixel spread probability surface, from `scfmSpread`.")
   ),
   outputObjects = bindrows(
     createsOutput("burnProbability", "SpatRaster",
@@ -115,112 +100,190 @@ doEvent.scfm_burnProbability <- function(sim, eventTime, eventType, debug = FALS
 
 #' Estimate this interval's burn probability by Monte Carlo
 #'
-#' Snapshots every `sim$` object that `scfmIgnition::Ignite()`, `scfmEscape::Escape()`
-#' and `scfmSpread::Burnemup()` write to, then runs `P(sim)$nIterations` independent
-#' draws of ignitions, escapes and fire spread (re-calling those modules' own
-#' functions, via `sim$.mods`, so the Monte Carlo draws use exactly the same
-#' stochastic logic as a real simulation year), tallying how many iterations burn
-#' each pixel. The snapshotted objects are restored before returning, so this module
-#' never alters the "realized" simulation outputs other modules (e.g. vegetation or
-#' carbon accounting) depend on -- it only adds `burnProbability`.
-#'
-#' Unlike `fireSense_burn`, scfm has no year-level random effect shared across that
-#' year's fires: the only stochasticity is the per-pixel ignition draw
-#' (`calcIgnitions()`, inside `Ignite()`) and the `spread2()` calls inside `Escape()`
-#' and `Burnemup()`. The probability surfaces `pIg`, `p0` and `pSpread` are computed
-#' once per year upstream and are *not* recomputed each iteration: they do not change
-#' between draws within one interval, only the ignition/escape/spread realization does.
-#'
-#' `scfmSpread::Burnemup()` reads `mod$pixInSAR` from its own module environment, so
-#' it must be called through `sim$.mods$scfmSpread$Burnemup()`, not reimplemented here.
+#' Thin wrapper around `runMonteCarlo()`: extracts this interval's inputs from
+#' `sim` and, if `P(sim)$.useCache` is `TRUE`, runs it through `Cache()` so that
+#' repeated calls with the same `pIg`, `p0`, `pSpread`, `flammableMap`,
+#' `fireRegimePolys`, `fireRegimeRas`, `nIterations` and `neighbours` values
+#' return the cached `burnProbability` instead of re-running `nIterations` Monte
+#' Carlo draws.
 #'
 #' @param sim A `simList`.
 #'
 #' @return The `simList`, invisibly, with `burnProbability`.
 estimateBurnProbability <- function(sim) {
+  pIg <- sim$pIg
+  p0 <- sim$p0
+  pSpread <- sim$pSpread
+  flammableMap <- sim$flammableMap
+  fireRegimePolys <- sim$fireRegimePolys
+  fireRegimeRas <- sim$fireRegimeRas
   nIter <- P(sim)$nIterations
+  neighboursEscape <- P(sim, "neighbours", "scfmEscape")
+  neighboursSpread <- P(sim, "neighbours", "scfmSpread")
 
-  snapshotNames <- c("ignitionLoci", "spreadState", "burnDT", "burnMap", "rstCurrentBurn",
-                     "burnSummary", "timeSinceFire")
-  snapshot <- snapshotSimObjects(sim, snapshotNames)
-
-  burnCount <- rast(sim$flammableMap)
-  burnCount[] <- 0
-  flamVals <- as.vector(sim$flammableMap)
-  burnCount[flamVals == 0] <- NA
-
-  for (i in seq_len(nIter)) {
-    sim <- runAsModule(sim, "scfmIgnition", sim$.mods$scfmIgnition$Ignite)
-    sim <- runAsModule(sim, "scfmEscape", sim$.mods$scfmEscape$Escape)
-    sim <- runAsModule(sim, "scfmSpread", sim$.mods$scfmSpread$Burnemup)
-
-    burned <- !is.na(terra::values(sim$rstCurrentBurn, mat = FALSE)) &
-      terra::values(sim$rstCurrentBurn, mat = FALSE) == 1
-    burnCount[which(burned)] <- burnCount[which(burned)] + 1
+  sim$burnProbability <- if (isTRUE(P(sim)$.useCache)) {
+    runMonteCarlo(pIg = pIg, p0 = p0, pSpread = pSpread, flammableMap = flammableMap,
+                  fireRegimePolys = fireRegimePolys, fireRegimeRas = fireRegimeRas, nIter = nIter,
+                  neighboursEscape = neighboursEscape, neighboursSpread = neighboursSpread) |>
+      Cache(cachePath = cachePath(sim), userTags = c(currentModule(sim), "runMonteCarlo"))
+  } else {
+    runMonteCarlo(pIg = pIg, p0 = p0, pSpread = pSpread, flammableMap = flammableMap,
+                  fireRegimePolys = fireRegimePolys, fireRegimeRas = fireRegimeRas, nIter = nIter,
+                  neighboursEscape = neighboursEscape, neighboursSpread = neighboursSpread)
   }
 
-  sim <- restoreSimObjects(sim, snapshot)
-
-  sim$burnProbability <- burnCount / nIter
-
   invisible(sim)
 }
 
-#' Run a delegate module's function with `current(sim)` set to that module
+#' Run the Monte Carlo burn-probability estimate
 #'
-#' `P(sim)` (no explicit module name) resolves against `sim@current$moduleName`,
-#' i.e. whichever module the scheduler currently has active -- not whichever
-#' module's function is lexically executing. Calling e.g.
-#' `sim$.mods$scfmSpread$Burnemup(sim)` directly from inside
-#' `scfm_burnProbability`'s own event leaves `sim@current$moduleName` set to
-#' `"scfm_burnProbability"`, so any `P(sim)$<param>` lookups inside `Burnemup()`
-#' silently return `NULL` instead of `scfmSpread`'s parameters. This wraps such
-#' a call so `sim@current$moduleName` is temporarily set to `moduleName`,
-#' restoring the prior value on the `simList` that `fn` returns.
+#' Runs `nIter` independent draws of ignitions, escapes and fire spread and
+#' tallies how many iterations burn each pixel. 
 #'
-#' @param sim A `simList`.
-#' @param moduleName character; the name of the module whose function is being run.
-#' @param fn The module's event function (e.g. `sim$.mods$scfmSpread$Burnemup`).
+#' For speed, each draw is simulated directly with `fastIgnite()`/`fastEscape()`/
+#' `fastBurn()` rather than by calling `scfmIgnition::Ignite()`/
+#' `scfmEscape::Escape()`/`scfmSpread::Burnemup()` through `sim$.mods` (as an
+#' earlier version of this function did). Profiling showed those modules' own
+#' event functions spend the large majority of their time on `terra` `SpatRaster`
+#' indexed reads/writes and `scfmSpread::Burnemup()`'s reporting bookkeeping
+#' (`countBurnedPixelsInSAR()`, `burnMap`/`timeSinceFire`/`burnSummary` updates,
+#' optional plotting) -- all necessary for a real simulation year, but not for
+#' estimating burn probability, which only needs the set of burned pixels per
+#' draw. The `fastIgnite()`/`fastEscape()`/`fastBurn()` helpers below reproduce
+#' the same stochastic draws (same `calcIgnitions()` logic, same `spread2()` calls
+#' with the same arguments) using plain vectors instead of `sim$`/`SpatRaster`
+#' access, and `burnCount` is accumulated as a plain integer vector and converted
+#' to a `SpatRaster` only once, after the loop. **These helpers duplicate core
+#' logic from `scfmIgnition::Ignite()`/`calcIgnitions()`, `scfmEscape::Escape()`
+#' and `scfmSpread::Burnemup()`; if those modules' fire-process logic changes,
+#' this function must be updated to match.**
 #'
-#' @return The `simList`, as returned by `fn`.
-runAsModule <- function(sim, moduleName, fn) {
-  prevCurrent <- sim@current
-  sim@current <- modifyList(prevCurrent, list(moduleName = moduleName))
-  sim <- fn(sim)
-  sim@current <- prevCurrent
-  sim
+#' @param pIg `SpatRaster` or numeric; this year's per-pixel ignition probability surface.
+#' @param p0 `SpatRaster` or numeric; this year's per-pixel escape probability surface.
+#' @param pSpread `SpatRaster` or numeric; this year's per-pixel spread probability surface.
+#' @param flammableMap `SpatRaster`; binary/categorical flammability raster. Template
+#'   for the returned `burnProbability`, and passed straight to `spread2()`.
+#' @param fireRegimePolys `SpatVector`; fire regime polygons with `maxBurnCells` and `PolyID`.
+#' @param fireRegimeRas `SpatRaster`; raster of fire regime polygon IDs.
+#' @param nIter integer; number of Monte Carlo iterations.
+#' @param neighboursEscape integer; `scfmEscape`'s `neighbours` parameter.
+#' @param neighboursSpread integer; `scfmSpread`'s `neighbours` parameter.
+#'
+#' @return A `SpatRaster`: estimated probability each flammable pixel burns this
+#'   interval (`NA` where not flammable).
+runMonteCarlo <- function(pIg, p0, pSpread, flammableMap, fireRegimePolys, fireRegimeRas,
+                         nIter, neighboursEscape, neighboursSpread) {
+  flamVals <- as.vector(flammableMap)
+  nCell <- terra::ncell(flammableMap)
+
+  fireRegimeVals <- as.vector(fireRegimeRas)
+  fireRegimePixels <- which(!is.na(fireRegimeVals))
+  pIgVals <- if (inherits(pIg, "SpatRaster")) as.vector(pIg) else pIg
+  p0Vals <- if (inherits(p0, "SpatRaster")) as.vector(p0) else p0
+  ## pSpread is left as-is: spread2() accepts either a SpatRaster or a scalar directly
+
+  maxSizesByPoly <- if (!is.null(fireRegimePolys$maxBurnCells)) {
+    fireRegimePolys$maxBurnCells[match(fireRegimeVals, fireRegimePolys$PolyID)]
+  } else {
+    NULL ## no per-polygon cap: fastEscape() falls back to NA_real_ (no cap)
+  }
+
+  burnCount <- integer(nCell)
+
+  for (i in seq_len(nIter)) {
+    ignitionLoci <- fastIgnite(fireRegimePixels, pIgVals, nCell)
+    spreadState <- fastEscape(flammableMap, ignitionLoci, p0Vals, neighboursEscape,
+                              maxSizesByPoly)
+    burnedPixels <- fastBurn(flammableMap, spreadState, pSpread, neighboursSpread)
+
+    if (length(burnedPixels) > 0) burnCount[burnedPixels] <- burnCount[burnedPixels] + 1L
+  }
+
+  burnProbability <- rast(flammableMap)
+  burnProbability[] <- burnCount / nIter
+  burnProbability[!(flamVals %in% 1)] <- NA ## flamVals may hold NaN (not NA) where not flammable
+  burnProbability
 }
 
-#' Snapshot a set of `sim$` objects before they are overwritten
+#' Draw one Monte Carlo iteration's ignitions
 #'
-#' `SpatRaster`s are deep-copied (`terra::deepcopy()`): otherwise they alias the same
-#' underlying pointer, and `restoreSimObjects()` would "restore" a reference to data
-#' the Monte Carlo loop has already overwritten. `data.table`s are copied with
-#' `data.table::copy()` for the same reason (they are modified by reference).
+#' Mirrors `scfmIgnition::calcIgnitions()` (same `runif()` draw against `pIg`),
+#' operating on a plain vector of candidate pixel indices and probabilities
+#' instead of re-deriving them from `sim$` each call. Does not reproduce
+#' `scfmIgnition::Ignite()`'s `SpaDES.tools:::resample()` permutation step, which
+#' only randomizes draw order for cosmetic/display reasons and does not affect
+#' which pixels ignite.
 #'
-#' @param sim A `simList`.
-#' @param names character; the `sim$` object names to snapshot.
+#' @param fireRegimePixels integer; candidate pixel indices (non-`NA` in
+#'   `fireRegimeRas`), precomputed once outside the Monte Carlo loop.
+#' @param pIgVals numeric; either a per-pixel ignition-probability vector
+#'   (same length as the full raster, indexed like `fireRegimePixels`) or a
+#'   single scalar probability.
+#' @param nCell integer; total number of cells in the template raster (used only
+#'   when `pIgVals` is a per-pixel vector).
 #'
-#' @return A named list holding each object's copy (or `NULL` if absent).
-snapshotSimObjects <- function(sim, names) {
-  setNames(lapply(names, function(n) {
-    obj <- sim[[n]]
-    if (is.null(obj)) return(NULL)
-    if (inherits(obj, "SpatRaster")) return(terra::deepcopy(obj))
-    if (is.data.table(obj)) return(data.table::copy(obj))
-    obj
-  }), names)
+#' @return Integer vector of ignition pixel indices.
+fastIgnite <- function(fireRegimePixels, pIgVals, nCell) {
+  if (length(pIgVals) > 1) {
+    which(runif(nCell) < pIgVals) ## NAs in pIgVals are omitted, as in calcIgnitions()
+  } else {
+    fireRegimePixels[which(runif(length(fireRegimePixels)) <= pIgVals)]
+  }
 }
 
-#' Restore `sim$` objects from a snapshot
+#' Draw one Monte Carlo iteration's escapes
 #'
-#' @param sim A `simList`.
-#' @param snapshot A named list, as returned by `snapshotSimObjects()`.
+#' Mirrors `scfmEscape::Escape()`: a single-iteration `spread2()` call from this
+#' draw's ignition loci, with the same per-fire size cap logic (`maxBurnCells`,
+#' looked up per ignition pixel's fire-regime polygon).
 #'
-#' @return The `simList`, invisibly, with each snapshotted object restored.
-restoreSimObjects <- function(sim, snapshot) {
-  for (n in names(snapshot)) sim[[n]] <- snapshot[[n]]
-  invisible(sim)
+#' @param flammableMap `SpatRaster`; passed straight to `spread2()`.
+#' @param ignitionLoci integer; this draw's ignition pixel indices, from `fastIgnite()`.
+#' @param p0Vals `SpatRaster` or numeric; escape probability, passed straight to `spread2()`.
+#' @param neighbours integer; `scfmEscape`'s `neighbours` parameter.
+#' @param maxSizesByPoly numeric or `NULL`; per-pixel `maxBurnCells` lookup
+#'   (indexed like the full raster), precomputed once outside the loop, or `NULL`
+#'   if `fireRegimePolys` has no `maxBurnCells` column.
+#'
+#' @return A `data.table`, as returned by `spread2()` (`NULL` if no ignitions).
+fastEscape <- function(flammableMap, ignitionLoci, p0Vals, neighbours, maxSizesByPoly) {
+  if (length(ignitionLoci) == 0) return(NULL)
+
+  maxSizes <- if (is.null(maxSizesByPoly)) NA_real_ else maxSizesByPoly[ignitionLoci]
+
+  SpaDES.tools::spread2(landscape = flammableMap, start = ignitionLoci, iterations = 1,
+                        spreadProb = p0Vals, directions = neighbours, maxSize = maxSizes,
+                        asRaster = FALSE)
+}
+
+#' Draw one Monte Carlo iteration's fire spread
+#'
+#' Mirrors `scfmSpread::Burnemup()`'s core `spread2()` call, skipping the
+#' reporting/bookkeeping steps (`countBurnedPixelsInSAR()`,
+#' `rstCurrentBurn`/`burnMap`/`timeSinceFire`/`burnSummary` updates, plotting)
+#' that are not needed for the burn-probability estimate. Matches `Burnemup()`'s
+#' own `maxSizes <- NA_real_` fallback when `fireRegimePolys$maxBurnCells` is
+#' set, since each fire's cap already travels with it via `spreadState` by the
+#' time this step runs.
+#'
+#' @param flammableMap `SpatRaster`; passed straight to `spread2()`.
+#' @param spreadState `data.table` or `NULL`; this draw's escape result, from `fastEscape()`.
+#' @param pSpread `SpatRaster` or numeric; spread probability, passed straight to `spread2()`.
+#' @param neighbours integer; `scfmSpread`'s `neighbours` parameter.
+#'
+#' @return Integer vector of burned pixel indices (empty if nothing burned).
+fastBurn <- function(flammableMap, spreadState, pSpread, neighbours) {
+  if (is.null(spreadState) || nrow(spreadState) == 0) return(integer(0))
+
+  if (nrow(spreadState[spreadState$state == "activeSource", ]) > 0) {
+    burnDT <- SpaDES.tools::spread2(flammableMap, start = spreadState, spreadProb = pSpread,
+                                    directions = neighbours, maxSize = NA_real_, asRaster = FALSE)
+  } else {
+    ## No fire escaped: each ignition burned its own pixel (as in Burnemup()).
+    burnDT <- spreadState
+  }
+
+  burnDT$pixels
 }
 
 #' Supply default inputs
